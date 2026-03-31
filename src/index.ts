@@ -7,1063 +7,885 @@ import {
   ListToolsRequestSchema,
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
-import axios from 'axios';
+import axios, { AxiosInstance } from 'axios';
 
-const JENKINS_URL = process.env.JENKINS_URL || '';
+const JENKINS_URL  = process.env.JENKINS_URL  || '';
 const JENKINS_USER = process.env.JENKINS_USER || '';
-const JENKINS_TOKEN = process.env.JENKINS_TOKEN || '';
+const JENKINS_TOKEN= process.env.JENKINS_TOKEN|| '';
 
-interface BuildStatus {
-  building: boolean;
-  result: string | null;
-  timestamp: number;
-  duration: number;
-  url: string;
-}
-
+// ─── Types ────────────────────────────────────────────────────────────────────
 interface FlatJob {
-  name: string;
-  fullPath: string;
-  url: string;
-  lastBuild: {
-    number: number;
-    result: string;
-    url: string;
-  } | null;
+  name: string; fullPath: string; url: string;
+  lastBuild: { number: number; result: string; url: string } | null;
   isFolder: boolean;
 }
 
+// ─── Shared tool schema helpers ────────────────────────────────────────────────
+const jobPathProp    = { jobPath:    { type: 'string', description: 'Path to the Jenkins job' } };
+const buildNumProp   = { buildNumber:{ type: 'string', description: 'Build number or "lastBuild"', default: 'lastBuild' } };
+const limitProp      = { limit:      { type: 'number', description: 'Max results to return (default 10)', default: 10 } };
+
 class JenkinsServer {
   private server: Server;
-  private axiosInstance: any;
+  private http: AxiosInstance;
+  private crumbCache: { field: string; value: string; ts: number } | null = null;
 
   constructor() {
     this.server = new Server(
-      {
-        name: 'jenkins-server',
-        version: '0.2.0',
-      },
-      {
-        capabilities: {
-          tools: {},
-        },
-      }
+      { name: 'jenkins-server', version: '0.3.0' },
+      { capabilities: { tools: {} } }
     );
-
-    this.axiosInstance = axios.create({
+    this.http = axios.create({
       baseURL: JENKINS_URL,
-      auth: {
-        username: JENKINS_USER,
-        password: JENKINS_TOKEN,
-      },
+      auth: { username: JENKINS_USER, password: JENKINS_TOKEN },
+      timeout: 30_000,
     });
-
     this.setupToolHandlers();
-
-    this.server.onerror = (error) => console.error('[MCP Error]', error);
-    process.on('SIGINT', async () => {
-      await this.server.close();
-      process.exit(0);
-    });
+    this.server.onerror = (err) => console.error('[MCP Error]', err);
+    process.on('SIGINT', async () => { await this.server.close(); process.exit(0); });
   }
 
-  // ─── Helper: Convert "FolderA/SubFolder/Job" → "job/FolderA/job/SubFolder/job/Job" ───
+  // ─── Helpers ────────────────────────────────────────────────────────────────
+
+  /** "FolderA/Sub/Job"  →  "job/FolderA/job/Sub/job/Job" */
   private toJenkinsPath(path: string): string {
-    return path
-      .split('/')
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .map((s) => `job/${encodeURIComponent(s)}`)
-      .join('/');
+    return path.split('/').map(s => s.trim()).filter(Boolean)
+      .map(s => `job/${encodeURIComponent(s)}`).join('/');
   }
 
+  /** Cached crumb (5-min TTL) to reduce round-trips */
+  private async getCrumb(): Promise<Record<string, string>> {
+    const now = Date.now();
+    if (this.crumbCache && now - this.crumbCache.ts < 5 * 60_000) {
+      return { [this.crumbCache.field]: this.crumbCache.value };
+    }
+    const r = await this.http.get('/crumbIssuer/api/json');
+    this.crumbCache = { field: r.data.crumbRequestField, value: r.data.crumb, ts: now };
+    return { [r.data.crumbRequestField]: r.data.crumb };
+  }
+
+  /** POST helper — always fetches fresh crumb header */
+  private async post(path: string, body: Record<string,string> | null = null) {
+    const crumb = await this.getCrumb();
+    if (body && Object.keys(body).length) {
+      const params = new URLSearchParams(body);
+      return this.http.post(path, params, {
+        headers: { ...crumb, 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+    }
+    return this.http.post(path, {}, { headers: crumb });
+  }
+
+  private ok(text: string)  { return { content: [{ type: 'text', text }] }; }
+  private json(data: unknown){ return this.ok(JSON.stringify(data, null, 2)); }
+
+  // ─── Tool Registration ───────────────────────────────────────────────────────
   private setupToolHandlers() {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
-        // ── Existing tools ────────────────────────────────────────────────────
+        // ── Status & Info ──────────────────────────────────────────────────────
         {
           name: 'get_build_status',
-          description: 'Get the status of a Jenkins build',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              jobPath: {
-                type: 'string',
-                description: 'Path to the Jenkins job (e.g., "view/xxx_debug")',
-              },
-              buildNumber: {
-                type: 'string',
-                description: 'Build number (use "lastBuild" for most recent)',
-              },
-            },
-            required: ['jobPath'],
-          },
+          description: 'Get the status of a specific (or last) build for a job.',
+          inputSchema: { type: 'object', properties: { ...jobPathProp, ...buildNumProp }, required: ['jobPath'] },
         },
         {
           name: 'list_all_jobs',
-          description: 'List all Jenkins jobs with their name, URL, and last build status.',
+          description: 'List all top-level Jenkins jobs with their last build status.',
           inputSchema: { type: 'object', properties: {}, required: [] },
         },
         {
           name: 'list_folder_jobs',
-          description:
-            'List all jobs inside a Jenkins folder, including nested sub-folders up to 4 levels deep.',
+          description: 'Recursively list all jobs inside a Jenkins folder (up to 4 levels deep).',
           inputSchema: {
             type: 'object',
-            properties: {
-              folderPath: {
-                type: 'string',
-                description: 'Folder name or slash-separated nested path. E.g. "CS" or "CS/PP"',
-              },
-            },
+            properties: { folderPath: { type: 'string', description: 'E.g. "CS" or "CS/PP"' } },
             required: ['folderPath'],
           },
         },
         {
           name: 'list_recent_failed_jobs',
-          description:
-            'List Jenkins jobs whose most recent build failed, sorted by most recent failure time.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              limit: { type: 'number', description: 'Max failed jobs to return', default: 10 },
-            },
-            required: [],
-          },
+          description: 'List jobs whose last build failed, sorted by most recent failure.',
+          inputSchema: { type: 'object', properties: { ...limitProp }, required: [] },
         },
         {
           name: 'count_failed_jobs',
-          description: 'Count how many Jenkins jobs currently have their last build in FAILURE state.',
+          description: 'Count jobs whose last build is in FAILURE state.',
           inputSchema: { type: 'object', properties: {}, required: [] },
         },
-        {
-          name: 'get_failed_build_log',
-          description: 'Get the console output of the last failed build for a given Jenkins job.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              jobPath: { type: 'string', description: 'Path to the Jenkins job' },
-            },
-            required: ['jobPath'],
-          },
-        },
-        {
-          name: 'create_jenkins_user',
-          description: 'Create a new Jenkins user in the internal user database. Requires admin permissions.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              username: { type: 'string' },
-              password: { type: 'string' },
-              fullName: { type: 'string' },
-              email: { type: 'string' },
-            },
-            required: ['username', 'password'],
-          },
-        },
-        {
-          name: 'trigger_build',
-          description: 'Trigger a new Jenkins build',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              jobPath: { type: 'string', description: 'Path to the Jenkins job' },
-              parameters: {
-                type: 'object',
-                description: 'Build parameters (optional)',
-                additionalProperties: true,
-              },
-            },
-            required: ['jobPath', 'parameters'],
-          },
-        },
-        {
-          name: 'get_build_log',
-          description: 'Get the console output of a Jenkins build',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              jobPath: { type: 'string' },
-              buildNumber: { type: 'string', description: 'Build number or "lastBuild"' },
-            },
-            required: ['jobPath', 'buildNumber'],
-          },
-        },
-
-        // ── NEW: Build Control ────────────────────────────────────────────────
-        {
-          name: 'abort_build',
-          description: 'Abort a currently running Jenkins build. Use buildNumber "lastBuild" to stop the most recent.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              jobPath: { type: 'string', description: 'Path to the Jenkins job' },
-              buildNumber: {
-                type: 'string',
-                description: 'Build number to abort, or "lastBuild" for the current one',
-                default: 'lastBuild',
-              },
-            },
-            required: ['jobPath'],
-          },
-        },
-        {
-          name: 'retry_failed_build',
-          description:
-            'Re-trigger the last failed build of a job using the same parameters. Saves you from looking up build info manually.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              jobPath: { type: 'string', description: 'Path to the Jenkins job' },
-            },
-            required: ['jobPath'],
-          },
-        },
-        {
-          name: 'bulk_trigger',
-          description:
-            'Trigger multiple Jenkins jobs in a single call. Useful for deploying a stack of services at once.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              jobs: {
-                type: 'array',
-                description: 'Array of jobs to trigger',
-                items: {
-                  type: 'object',
-                  properties: {
-                    jobPath: { type: 'string' },
-                    parameters: { type: 'object', additionalProperties: true },
-                  },
-                  required: ['jobPath'],
-                },
-              },
-            },
-            required: ['jobs'],
-          },
-        },
-
-        // ── NEW: Visibility & Monitoring ──────────────────────────────────────
-        {
-          name: 'get_running_builds',
-          description:
-            'List all jobs that are currently building across the entire Jenkins server.',
-          inputSchema: { type: 'object', properties: {}, required: [] },
-        },
-        {
-          name: 'get_queue_items',
-          description:
-            'Show all builds waiting in the Jenkins queue (e.g. stuck waiting for an available agent).',
-          inputSchema: { type: 'object', properties: {}, required: [] },
-        },
-        {
-          name: 'get_build_history',
-          description:
-            'Get the last N builds for a specific job with result, duration, and timestamp — useful for spotting flaky jobs.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              jobPath: { type: 'string', description: 'Path to the Jenkins job' },
-              limit: { type: 'number', description: 'Number of builds to return (default 10)', default: 10 },
-            },
-            required: ['jobPath'],
-          },
-        },
-        {
-          name: 'get_build_changes',
-          description:
-            'Show the Git commits / SCM changes included in a specific build. Useful for tracing what code went into a deployment.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              jobPath: { type: 'string', description: 'Path to the Jenkins job' },
-              buildNumber: { type: 'string', description: 'Build number or "lastBuild"', default: 'lastBuild' },
-            },
-            required: ['jobPath'],
-          },
-        },
-
-        // ── NEW: Test & Quality ───────────────────────────────────────────────
-        {
-          name: 'get_test_results',
-          description:
-            'Fetch pass/fail/skip counts and the names of failed tests from a build\'s test report.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              jobPath: { type: 'string', description: 'Path to the Jenkins job' },
-              buildNumber: { type: 'string', description: 'Build number or "lastBuild"', default: 'lastBuild' },
-            },
-            required: ['jobPath'],
-          },
-        },
-
-        // ── NEW: Infrastructure ───────────────────────────────────────────────
-        {
-          name: 'get_nodes',
-          description:
-            'List all Jenkins agents/nodes with their online/offline status, number of executors, and assigned labels.',
-          inputSchema: { type: 'object', properties: {}, required: [] },
-        },
-        {
-          name: 'toggle_job',
-          description:
-            'Enable or disable a Jenkins job without using the UI. Useful for suppressing noisy or broken jobs temporarily.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              jobPath: { type: 'string', description: 'Path to the Jenkins job' },
-              action: {
-                type: 'string',
-                enum: ['enable', 'disable'],
-                description: '"enable" or "disable"',
-              },
-            },
-            required: ['jobPath', 'action'],
-          },
-        },
-
-        // ── NEW: Discovery ────────────────────────────────────────────────────
         {
           name: 'search_jobs',
-          description:
-            'Search for jobs by name across all top-level jobs and folders. Supports substring and case-insensitive matching.',
+          description: 'Case-insensitive substring search across all top-level job names.',
           inputSchema: {
             type: 'object',
             properties: {
-              query: { type: 'string', description: 'Substring to search for in job names' },
-              caseSensitive: {
-                type: 'boolean',
-                description: 'Whether the search is case-sensitive (default false)',
-                default: false,
-              },
+              query: { type: 'string', description: 'Substring to search for' },
+              caseSensitive: { type: 'boolean', default: false },
             },
             required: ['query'],
           },
         },
         {
           name: 'get_job_parameters',
-          description:
-            'Inspect what parameters a job accepts before triggering it, including their names, types, and default values.',
+          description: 'Show all parameter definitions for a job before triggering it.',
+          inputSchema: { type: 'object', properties: { ...jobPathProp }, required: ['jobPath'] },
+        },
+        // ── Logs ──────────────────────────────────────────────────────────────
+        {
+          name: 'get_build_log',
+          description: 'Get the full console output of a build.',
+          inputSchema: { type: 'object', properties: { ...jobPathProp, ...buildNumProp }, required: ['jobPath', 'buildNumber'] },
+        },
+        {
+          name: 'get_failed_build_log',
+          description: 'Shortcut: get the console output of the last *failed* build.',
+          inputSchema: { type: 'object', properties: { ...jobPathProp }, required: ['jobPath'] },
+        },
+        {
+          name: 'get_build_log_tail',   // NEW
+          description: 'Get only the last N lines of a build\'s console output — faster for large logs.',
           inputSchema: {
             type: 'object',
             properties: {
-              jobPath: { type: 'string', description: 'Path to the Jenkins job' },
+              ...jobPathProp, ...buildNumProp,
+              lines: { type: 'number', description: 'Number of tail lines (default 100)', default: 100 },
             },
             required: ['jobPath'],
           },
         },
+        // ── Trigger & Control ─────────────────────────────────────────────────
+        {
+          name: 'trigger_build',
+          description: 'Trigger a Jenkins build, optionally with parameters.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              ...jobPathProp,
+              parameters: { type: 'object', additionalProperties: true },
+            },
+            required: ['jobPath'],
+          },
+        },
+        {
+          name: 'abort_build',
+          description: 'Abort a currently running build.',
+          inputSchema: { type: 'object', properties: { ...jobPathProp, ...buildNumProp }, required: ['jobPath'] },
+        },
+        {
+          name: 'retry_failed_build',
+          description: 'Re-trigger the last failed build with the same parameters.',
+          inputSchema: { type: 'object', properties: { ...jobPathProp }, required: ['jobPath'] },
+        },
+        {
+          name: 'bulk_trigger',
+          description: 'Trigger multiple jobs in one call.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              jobs: {
+                type: 'array',
+                items: { type: 'object', properties: { ...jobPathProp, parameters: { type: 'object', additionalProperties: true } }, required: ['jobPath'] },
+              },
+            },
+            required: ['jobs'],
+          },
+        },
+        {
+          name: 'toggle_job',
+          description: 'Enable or disable a Jenkins job.',
+          inputSchema: {
+            type: 'object',
+            properties: { ...jobPathProp, action: { type: 'string', enum: ['enable', 'disable'] } },
+            required: ['jobPath', 'action'],
+          },
+        },
+        {
+          name: 'copy_job',           // NEW
+          description: 'Copy (clone) an existing Jenkins job to a new name.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              sourceJobPath: { type: 'string', description: 'Existing job path' },
+              newJobName:    { type: 'string', description: 'Name for the new job (no slashes)' },
+            },
+            required: ['sourceJobPath', 'newJobName'],
+          },
+        },
+        {
+          name: 'delete_build',       // NEW
+          description: 'Permanently delete a specific build record from Jenkins.',
+          inputSchema: { type: 'object', properties: { ...jobPathProp, ...buildNumProp }, required: ['jobPath', 'buildNumber'] },
+        },
+        // ── Monitoring ────────────────────────────────────────────────────────
+        {
+          name: 'get_running_builds',
+          description: 'List all builds currently in progress across the server.',
+          inputSchema: { type: 'object', properties: {}, required: [] },
+        },
+        {
+          name: 'get_queue_items',
+          description: 'Show builds waiting in the Jenkins queue.',
+          inputSchema: { type: 'object', properties: {}, required: [] },
+        },
+        {
+          name: 'cancel_queue_item',  // NEW
+          description: 'Cancel a specific item waiting in the Jenkins queue.',
+          inputSchema: {
+            type: 'object',
+            properties: { itemId: { type: 'number', description: 'Queue item ID (from get_queue_items)' } },
+            required: ['itemId'],
+          },
+        },
+        {
+          name: 'get_build_history',
+          description: 'Get the last N builds for a job with result, duration, and stability %.',
+          inputSchema: { type: 'object', properties: { ...jobPathProp, ...limitProp }, required: ['jobPath'] },
+        },
+        {
+          name: 'get_build_changes',
+          description: 'Show SCM commits included in a specific build.',
+          inputSchema: { type: 'object', properties: { ...jobPathProp, ...buildNumProp }, required: ['jobPath'] },
+        },
+        {
+          name: 'get_build_artifacts', // NEW
+          description: 'List artifacts produced by a build (name + download URL).',
+          inputSchema: { type: 'object', properties: { ...jobPathProp, ...buildNumProp }, required: ['jobPath'] },
+        },
+        {
+          name: 'get_build_timings',   // NEW
+          description: 'Return start time, duration, and estimated remaining time for a build.',
+          inputSchema: { type: 'object', properties: { ...jobPathProp, ...buildNumProp }, required: ['jobPath'] },
+        },
+        // ── Test & Quality ────────────────────────────────────────────────────
+        {
+          name: 'get_test_results',
+          description: 'Fetch pass/fail/skip counts and failed test names from a build.',
+          inputSchema: { type: 'object', properties: { ...jobPathProp, ...buildNumProp }, required: ['jobPath'] },
+        },
+        {
+          name: 'get_flaky_tests',     // NEW
+          description: 'Identify tests that flip between PASS and FAIL across the last N builds.',
+          inputSchema: {
+            type: 'object',
+            properties: { ...jobPathProp, ...limitProp },
+            required: ['jobPath'],
+          },
+        },
+        // ── Nodes / Infrastructure ────────────────────────────────────────────
+        {
+          name: 'get_nodes',
+          description: 'List all Jenkins agents with online/offline status, executors, and labels.',
+          inputSchema: { type: 'object', properties: {}, required: [] },
+        },
+        {
+          name: 'toggle_node',         // NEW
+          description: 'Take a node online or mark it temporarily offline.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              nodeName: { type: 'string', description: 'Node display name (exact match)' },
+              action:   { type: 'string', enum: ['online', 'offline'], description: '"online" or "offline"' },
+              reason:   { type: 'string', description: 'Reason message when going offline (optional)' },
+            },
+            required: ['nodeName', 'action'],
+          },
+        },
+        // ── Server Health ─────────────────────────────────────────────────────
+        {
+          name: 'get_server_info',     // NEW
+          description: 'Return Jenkins version, number of executors, load statistics, and quiet-down status.',
+          inputSchema: { type: 'object', properties: {}, required: [] },
+        },
+        {
+          name: 'quiet_down',          // NEW
+          description: 'Put the Jenkins server into quiet-down (preparation for shutdown) or cancel it.',
+          inputSchema: {
+            type: 'object',
+            properties: { action: { type: 'string', enum: ['start', 'cancel'] } },
+            required: ['action'],
+          },
+        },
+        // ── Users ─────────────────────────────────────────────────────────────
+        {
+          name: 'create_jenkins_user',
+          description: 'Create a new Jenkins user (requires admin permissions).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              username: { type: 'string' }, password: { type: 'string' },
+              fullName: { type: 'string' }, email: { type: 'string' },
+            },
+            required: ['username', 'password'],
+          },
+        },
+        {
+          name: 'list_users',          // NEW
+          description: 'List all Jenkins users.',
+          inputSchema: { type: 'object', properties: {}, required: [] },
+        },
       ],
     }));
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    this.server.setRequestHandler(CallToolRequestSchema, async (req) => {
+      const a = req.params.arguments as any;
       try {
-        switch (request.params.name) {
-          // Existing
-          case 'get_build_status':      return await this.getBuildStatus(request.params.arguments);
-          case 'trigger_build':         return await this.triggerBuild(request.params.arguments);
-          case 'get_build_log':         return await this.getBuildLog(request.params.arguments);
-          case 'list_recent_failed_jobs': return await this.listRecentFailedJobs(request.params.arguments);
-          case 'list_all_jobs':         return await this.listAllJobs();
-          case 'list_folder_jobs':      return await this.listFolderJobs(request.params.arguments);
-          case 'count_failed_jobs':     return await this.countFailedJobs();
-          case 'get_failed_build_log':  return await this.getFailedBuildLog(request.params.arguments);
-          case 'create_jenkins_user':   return await this.createJenkinsUser(request.params.arguments);
-          // New — Build Control
-          case 'abort_build':           return await this.abortBuild(request.params.arguments);
-          case 'retry_failed_build':    return await this.retryFailedBuild(request.params.arguments);
-          case 'bulk_trigger':          return await this.bulkTrigger(request.params.arguments);
-          // New — Visibility & Monitoring
-          case 'get_running_builds':    return await this.getRunningBuilds();
-          case 'get_queue_items':       return await this.getQueueItems();
-          case 'get_build_history':     return await this.getBuildHistory(request.params.arguments);
-          case 'get_build_changes':     return await this.getBuildChanges(request.params.arguments);
-          // New — Test & Quality
-          case 'get_test_results':      return await this.getTestResults(request.params.arguments);
-          // New — Infrastructure
-          case 'get_nodes':             return await this.getNodes();
-          case 'toggle_job':            return await this.toggleJob(request.params.arguments);
-          // New — Discovery
-          case 'search_jobs':           return await this.searchJobs(request.params.arguments);
-          case 'get_job_parameters':    return await this.getJobParameters(request.params.arguments);
-
+        switch (req.params.name) {
+          // Status & Info
+          case 'get_build_status':        return await this.getBuildStatus(a);
+          case 'list_all_jobs':           return await this.listAllJobs();
+          case 'list_folder_jobs':        return await this.listFolderJobs(a);
+          case 'list_recent_failed_jobs': return await this.listRecentFailedJobs(a);
+          case 'count_failed_jobs':       return await this.countFailedJobs();
+          case 'search_jobs':             return await this.searchJobs(a);
+          case 'get_job_parameters':      return await this.getJobParameters(a);
+          // Logs
+          case 'get_build_log':           return await this.getBuildLog(a);
+          case 'get_failed_build_log':    return await this.getFailedBuildLog(a);
+          case 'get_build_log_tail':      return await this.getBuildLogTail(a);
+          // Trigger & Control
+          case 'trigger_build':           return await this.triggerBuild(a);
+          case 'abort_build':             return await this.abortBuild(a);
+          case 'retry_failed_build':      return await this.retryFailedBuild(a);
+          case 'bulk_trigger':            return await this.bulkTrigger(a);
+          case 'toggle_job':              return await this.toggleJob(a);
+          case 'copy_job':                return await this.copyJob(a);
+          case 'delete_build':            return await this.deleteBuild(a);
+          // Monitoring
+          case 'get_running_builds':      return await this.getRunningBuilds();
+          case 'get_queue_items':         return await this.getQueueItems();
+          case 'cancel_queue_item':       return await this.cancelQueueItem(a);
+          case 'get_build_history':       return await this.getBuildHistory(a);
+          case 'get_build_changes':       return await this.getBuildChanges(a);
+          case 'get_build_artifacts':     return await this.getBuildArtifacts(a);
+          case 'get_build_timings':       return await this.getBuildTimings(a);
+          // Test & Quality
+          case 'get_test_results':        return await this.getTestResults(a);
+          case 'get_flaky_tests':         return await this.getFlakyTests(a);
+          // Nodes
+          case 'get_nodes':               return await this.getNodes();
+          case 'toggle_node':             return await this.toggleNode(a);
+          // Server Health
+          case 'get_server_info':         return await this.getServerInfo();
+          case 'quiet_down':              return await this.quietDown(a);
+          // Users
+          case 'create_jenkins_user':     return await this.createJenkinsUser(a);
+          case 'list_users':              return await this.listUsers();
           default:
-            throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
+            throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${req.params.name}`);
         }
-      } catch (error: any) {
-        if (error instanceof McpError) throw error;
-        if (axios.isAxiosError(error)) {
+      } catch (err: any) {
+        if (err instanceof McpError) throw err;
+        if (axios.isAxiosError(err)) {
           throw new McpError(
             ErrorCode.InternalError,
-            `Jenkins API error: ${error.response?.data?.message || error.message}`
+            `Jenkins API error [${err.response?.status}]: ${err.response?.data?.message || err.message}`
           );
         }
-        throw new McpError(ErrorCode.InternalError, 'Unknown error occurred');
+        throw new McpError(ErrorCode.InternalError, String(err?.message ?? 'Unknown error'));
       }
     });
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // EXISTING TOOLS (unchanged)
+  // STATUS & INFO
   // ═══════════════════════════════════════════════════════════════════════════
-
-  private async getBuildStatus(args: any) {
-    const buildNumber = args.buildNumber || 'lastBuild';
-    const response = await this.axiosInstance.get(`/${args.jobPath}/${buildNumber}/api/json`);
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          building: response.data.building,
-          result: response.data.result,
-          timestamp: response.data.timestamp,
-          duration: response.data.duration,
-          url: response.data.url,
-        }, null, 2),
-      }],
-    };
-  }
-
-  private async triggerBuild(args: any) {
-    const { jobPath, parameters } = args;
-    const crumbResp = await this.axiosInstance.get('/crumbIssuer/api/json');
-    const crumbField = crumbResp.data.crumbRequestField;
-    const crumbValue = crumbResp.data.crumb;
-
-    if (!parameters || Object.keys(parameters).length === 0) {
-      await this.axiosInstance.post(`/${jobPath}/build`, {}, {
-        headers: { [crumbField]: crumbValue },
-      });
-      return { content: [{ type: 'text', text: 'Job triggered successfully using /build' }] };
-    }
-
-    const body = new URLSearchParams();
-    Object.entries(parameters).forEach(([key, value]) => body.append(key, String(value)));
-    await this.axiosInstance.post(`/${jobPath}/buildWithParameters`, body, {
-      headers: { [crumbField]: crumbValue, 'Content-Type': 'application/x-www-form-urlencoded' },
+  private async getBuildStatus(a: any) {
+    const num = a.buildNumber || 'lastBuild';
+    const r = await this.http.get(`/${a.jobPath}/${num}/api/json`);
+    return this.json({
+      number: r.data.number,
+      building: r.data.building,
+      result: r.data.result,
+      startedAt: new Date(r.data.timestamp).toISOString(),
+      durationSeconds: Math.floor(r.data.duration / 1000),
+      url: r.data.url,
     });
-    return { content: [{ type: 'text', text: 'Parameterized job triggered successfully using /buildWithParameters' }] };
-  }
-
-  private async getBuildLog(args: any) {
-    const response = await this.axiosInstance.get(`/${args.jobPath}/${args.buildNumber}/consoleText`);
-    return { content: [{ type: 'text', text: response.data }] };
-  }
-
-  private async listRecentFailedJobs(args: any) {
-    const limit = args?.limit ?? 10;
-    const response = await this.axiosInstance.get('/api/json', {
-      params: { tree: 'jobs[name,url,lastBuild[number,result,timestamp,url]]' },
-    });
-    const failedJobs = (response.data.jobs || [])
-      .filter((job: any) => job.lastBuild?.result === 'FAILURE' && typeof job.lastBuild.timestamp === 'number')
-      .sort((a: any, b: any) => b.lastBuild.timestamp - a.lastBuild.timestamp)
-      .slice(0, limit)
-      .map((job: any) => ({
-        name: job.name,
-        jobUrl: job.url,
-        buildNumber: job.lastBuild.number,
-        result: job.lastBuild.result,
-        timestamp: job.lastBuild.timestamp,
-        buildUrl: job.lastBuild.url,
-      }));
-    return { content: [{ type: 'text', text: JSON.stringify({ count: failedJobs.length, failedJobs }, null, 2) }] };
   }
 
   private async listAllJobs() {
-    const response = await this.axiosInstance.get('/api/json', {
+    const r = await this.http.get('/api/json', {
       params: { tree: 'jobs[name,url,color,lastBuild[number,result,url]]' },
     });
-    const jobs = (response.data.jobs || []).map((job: any) => ({
-      name: job.name,
-      url: job.url,
-      lastBuild: job.lastBuild ? { number: job.lastBuild.number, result: job.lastBuild.result, url: job.lastBuild.url } : null,
-      statusColor: job.color,
+    const jobs = (r.data.jobs || []).map((j: any) => ({
+      name: j.name, url: j.url, statusColor: j.color,
+      lastBuild: j.lastBuild ? { number: j.lastBuild.number, result: j.lastBuild.result, url: j.lastBuild.url } : null,
     }));
-    return { content: [{ type: 'text', text: JSON.stringify({ count: jobs.length, jobs }, null, 2) }] };
+    return this.json({ count: jobs.length, jobs });
   }
 
-  private async listFolderJobs(args: any) {
-    const folderPath: string = args?.folderPath ?? '';
-    if (!folderPath.trim()) throw new McpError(ErrorCode.InvalidParams, 'folderPath is required.');
-
+  private async listFolderJobs(a: any) {
+    const folderPath: string = a?.folderPath ?? '';
+    if (!folderPath.trim()) throw new McpError(ErrorCode.InvalidParams, 'folderPath is required');
     const apiPath = this.toJenkinsPath(folderPath);
     const tree =
       'jobs[name,url,color,lastBuild[number,result,url],' +
         'jobs[name,url,color,lastBuild[number,result,url],' +
           'jobs[name,url,color,lastBuild[number,result,url],' +
             'jobs[name,url,color,lastBuild[number,result,url]]]]]';
-
-    const response = await this.axiosInstance.get(`/${apiPath}/api/json`, { params: { tree } });
-    const flatJobs: FlatJob[] = [];
-
-    const flatten = (jobs: any[], parentPath: string): void => {
-      for (const job of jobs) {
-        const fullPath = parentPath ? `${parentPath}/${job.name}` : job.name;
-        const isFolder = Array.isArray(job.jobs);
-        flatJobs.push({
-          name: job.name, fullPath, url: job.url,
-          lastBuild: job.lastBuild ? { number: job.lastBuild.number, result: job.lastBuild.result, url: job.lastBuild.url } : null,
-          isFolder,
-        });
-        if (isFolder && job.jobs.length > 0) flatten(job.jobs, fullPath);
+    const r = await this.http.get(`/${apiPath}/api/json`, { params: { tree } });
+    const flat: FlatJob[] = [];
+    const flatten = (jobs: any[], parent: string) => {
+      for (const j of jobs) {
+        const fullPath = parent ? `${parent}/${j.name}` : j.name;
+        const isFolder = Array.isArray(j.jobs);
+        flat.push({ name: j.name, fullPath, url: j.url,
+          lastBuild: j.lastBuild ? { number: j.lastBuild.number, result: j.lastBuild.result, url: j.lastBuild.url } : null,
+          isFolder });
+        if (isFolder && j.jobs.length) flatten(j.jobs, fullPath);
       }
     };
+    flatten(r.data.jobs || [], folderPath);
+    return this.json({
+      folderPath, totalItems: flat.length,
+      jobCount: flat.filter(j => !j.isFolder).length,
+      folderCount: flat.filter(j => j.isFolder).length,
+      jobs: flat,
+    });
+  }
 
-    flatten(response.data.jobs || [], folderPath);
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          folderPath, totalItems: flatJobs.length,
-          jobCount: flatJobs.filter((j) => !j.isFolder).length,
-          folderCount: flatJobs.filter((j) => j.isFolder).length,
-          jobs: flatJobs,
-        }, null, 2),
-      }],
-    };
+  private async listRecentFailedJobs(a: any) {
+    const limit = a?.limit ?? 10;
+    const r = await this.http.get('/api/json', {
+      params: { tree: 'jobs[name,url,lastBuild[number,result,timestamp,url]]' },
+    });
+    const failed = (r.data.jobs || [])
+      .filter((j: any) => j.lastBuild?.result === 'FAILURE')
+      .sort((x: any, y: any) => y.lastBuild.timestamp - x.lastBuild.timestamp)
+      .slice(0, limit)
+      .map((j: any) => ({
+        name: j.name, jobUrl: j.url,
+        buildNumber: j.lastBuild.number, result: j.lastBuild.result,
+        failedAt: new Date(j.lastBuild.timestamp).toISOString(),
+        buildUrl: j.lastBuild.url,
+      }));
+    return this.json({ count: failed.length, failedJobs: failed });
   }
 
   private async countFailedJobs() {
-    const response = await this.axiosInstance.get('/api/json', {
-      params: { tree: 'jobs[name,lastBuild[result]]' },
-    });
-    const failedCount = (response.data.jobs || []).filter((job: any) => job.lastBuild?.result === 'FAILURE').length;
-    return { content: [{ type: 'text', text: JSON.stringify({ failedJobCount: failedCount }, null, 2) }] };
+    const r = await this.http.get('/api/json', { params: { tree: 'jobs[lastBuild[result]]' } });
+    const count = (r.data.jobs || []).filter((j: any) => j.lastBuild?.result === 'FAILURE').length;
+    return this.json({ failedJobCount: count });
   }
 
-  private async getFailedBuildLog(args: any) {
-    if (!args?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
-    const jobInfo = await this.axiosInstance.get(`/${args.jobPath}/api/json`, {
-      params: { tree: 'name,url,lastFailedBuild[number,url]' },
-    });
-    const lastFailedBuild = jobInfo.data.lastFailedBuild;
-    if (!lastFailedBuild?.number) {
-      return { content: [{ type: 'text', text: `Job "${jobInfo.data.name}" has no failed builds.` }] };
-    }
-    const logResponse = await this.axiosInstance.get(`/${args.jobPath}/${lastFailedBuild.number}/consoleText`);
-    return { content: [{ type: 'text', text: logResponse.data }] };
-  }
-
-  private async createJenkinsUser(args: any) {
-    const { username, password, fullName, email } = args || {};
-    if (!username || !password) throw new McpError(ErrorCode.InvalidParams, 'username and password are required');
-
-    const crumbResp = await this.axiosInstance.get('/crumbIssuer/api/json');
-    const params = new URLSearchParams();
-    params.append('username', username);
-    params.append('password1', password);
-    params.append('password2', password);
-    if (fullName) params.append('fullname', fullName);
-    if (email) params.append('email', email);
-
-    await this.axiosInstance.post('/securityRealm/createAccountByAdmin', params, {
-      headers: {
-        [crumbResp.data.crumbRequestField]: crumbResp.data.crumb,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-    });
-    return { content: [{ type: 'text', text: `User "${username}" created successfully.` }] };
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // NEW: BUILD CONTROL
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * abort_build
-   * Stops a running build by POSTing to /{jobPath}/{buildNumber}/stop.
-   * Defaults to "lastBuild" if no build number is provided.
-   */
-  private async abortBuild(args: any) {
-    if (!args?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
-    const buildNumber = args.buildNumber || 'lastBuild';
-
-    const crumbResp = await this.axiosInstance.get('/crumbIssuer/api/json');
-
-    // First verify the build is actually running
-    const statusResp = await this.axiosInstance.get(`/${args.jobPath}/${buildNumber}/api/json`);
-    if (!statusResp.data.building) {
-      return {
-        content: [{
-          type: 'text',
-          text: `Build #${statusResp.data.number} is not currently running (result: ${statusResp.data.result ?? 'unknown'}).`,
-        }],
-      };
-    }
-
-    await this.axiosInstance.post(
-      `/${args.jobPath}/${statusResp.data.number}/stop`,
-      {},
-      { headers: { [crumbResp.data.crumbRequestField]: crumbResp.data.crumb } }
-    );
-
-    return {
-      content: [{
-        type: 'text',
-        text: `Build #${statusResp.data.number} of "${args.jobPath}" has been aborted.`,
-      }],
-    };
-  }
-
-  /**
-   * retry_failed_build
-   * Looks up the last failed build's parameters and re-triggers the job with
-   * the same parameter values, so you don't have to look anything up manually.
-   */
-  private async retryFailedBuild(args: any) {
-    if (!args?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
-
-    // Get last failed build number
-    const jobInfo = await this.axiosInstance.get(`/${args.jobPath}/api/json`, {
-      params: { tree: 'lastFailedBuild[number,actions[parameters[name,value]]]' },
-    });
-
-    const lastFailed = jobInfo.data.lastFailedBuild;
-    if (!lastFailed?.number) {
-      return { content: [{ type: 'text', text: `No failed builds found for "${args.jobPath}".` }] };
-    }
-
-    // Extract parameters from the failed build's actions
-    const parameters: Record<string, string> = {};
-    for (const action of lastFailed.actions || []) {
-      for (const param of action.parameters || []) {
-        parameters[param.name] = param.value;
-      }
-    }
-
-    // Re-trigger
-    const crumbResp = await this.axiosInstance.get('/crumbIssuer/api/json');
-    const hasParams = Object.keys(parameters).length > 0;
-
-    if (hasParams) {
-      const body = new URLSearchParams();
-      Object.entries(parameters).forEach(([k, v]) => body.append(k, String(v)));
-      await this.axiosInstance.post(`/${args.jobPath}/buildWithParameters`, body, {
-        headers: {
-          [crumbResp.data.crumbRequestField]: crumbResp.data.crumb,
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-      });
-    } else {
-      await this.axiosInstance.post(`/${args.jobPath}/build`, {}, {
-        headers: { [crumbResp.data.crumbRequestField]: crumbResp.data.crumb },
-      });
-    }
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          message: `Retried failed build #${lastFailed.number} of "${args.jobPath}".`,
-          parametersUsed: hasParams ? parameters : '(none)',
-        }, null, 2),
-      }],
-    };
-  }
-
-  /**
-   * bulk_trigger
-   * Triggers multiple jobs in sequence. Returns a per-job success/failure summary.
-   */
-  private async bulkTrigger(args: any) {
-    if (!Array.isArray(args?.jobs) || args.jobs.length === 0) {
-      throw new McpError(ErrorCode.InvalidParams, 'jobs array is required and must not be empty');
-    }
-
-    const crumbResp = await this.axiosInstance.get('/crumbIssuer/api/json');
-    const crumbHeader = { [crumbResp.data.crumbRequestField]: crumbResp.data.crumb };
-    const results: Array<{ jobPath: string; status: string; error?: string }> = [];
-
-    for (const job of args.jobs) {
-      try {
-        const { jobPath, parameters } = job;
-        const hasParams = parameters && Object.keys(parameters).length > 0;
-
-        if (hasParams) {
-          const body = new URLSearchParams();
-          Object.entries(parameters).forEach(([k, v]) => body.append(k, String(v)));
-          await this.axiosInstance.post(`/${jobPath}/buildWithParameters`, body, {
-            headers: { ...crumbHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
-          });
-        } else {
-          await this.axiosInstance.post(`/${jobPath}/build`, {}, { headers: crumbHeader });
-        }
-
-        results.push({ jobPath, status: 'triggered' });
-      } catch (err: any) {
-        results.push({
-          jobPath: job.jobPath,
-          status: 'failed',
-          error: err?.response?.data?.message || err?.message || 'Unknown error',
-        });
-      }
-    }
-
-    const succeeded = results.filter((r) => r.status === 'triggered').length;
-    const failed = results.filter((r) => r.status === 'failed').length;
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({ summary: { total: results.length, succeeded, failed }, results }, null, 2),
-      }],
-    };
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // NEW: VISIBILITY & MONITORING
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * get_running_builds
-   * Returns all jobs that currently have a build in progress.
-   */
-  private async getRunningBuilds() {
-    const response = await this.axiosInstance.get('/api/json', {
-      params: {
-        tree: 'jobs[name,url,lastBuild[number,building,timestamp,url,executor[currentExecutable[url]]]]',
-      },
-    });
-
-    const running = (response.data.jobs || [])
-      .filter((job: any) => job.lastBuild?.building === true)
-      .map((job: any) => ({
-        name: job.name,
-        jobUrl: job.url,
-        buildNumber: job.lastBuild.number,
-        buildUrl: job.lastBuild.url,
-        startedAt: new Date(job.lastBuild.timestamp).toISOString(),
-        runningForSeconds: Math.floor((Date.now() - job.lastBuild.timestamp) / 1000),
-      }));
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({ count: running.length, runningBuilds: running }, null, 2),
-      }],
-    };
-  }
-
-  /**
-   * get_queue_items
-   * Returns all items currently waiting in the Jenkins build queue.
-   */
-  private async getQueueItems() {
-    const response = await this.axiosInstance.get('/queue/api/json', {
-      params: {
-        tree: 'items[id,inQueueSince,why,blocked,stuck,task[name,url],actions[parameters[name,value]]]',
-      },
-    });
-
-    const items = (response.data.items || []).map((item: any) => ({
-      id: item.id,
-      jobName: item.task?.name,
-      jobUrl: item.task?.url,
-      inQueueSince: new Date(item.inQueueSince).toISOString(),
-      waitingForSeconds: Math.floor((Date.now() - item.inQueueSince) / 1000),
-      blocked: item.blocked,
-      stuck: item.stuck,
-      reason: item.why,
-      parameters: (item.actions || []).flatMap((a: any) => a.parameters || []).reduce(
-        (acc: any, p: any) => { acc[p.name] = p.value; return acc; }, {}
-      ),
-    }));
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({ count: items.length, queueItems: items }, null, 2),
-      }],
-    };
-  }
-
-  /**
-   * get_build_history
-   * Returns the last N builds for a job including result, duration, and timestamp.
-   */
-  private async getBuildHistory(args: any) {
-    if (!args?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
-    const limit = args.limit ?? 10;
-
-    const response = await this.axiosInstance.get(`/${args.jobPath}/api/json`, {
-      params: {
-        tree: `builds[number,result,duration,timestamp,url]{0,${limit}}`,
-      },
-    });
-
-    const builds = (response.data.builds || []).map((b: any) => ({
-      number: b.number,
-      result: b.result ?? (b.duration === 0 ? 'RUNNING' : 'UNKNOWN'),
-      durationSeconds: Math.floor(b.duration / 1000),
-      startedAt: new Date(b.timestamp).toISOString(),
-      url: b.url,
-    }));
-
-    // Derive a simple stability score: % of non-running builds that passed
-    const completed = builds.filter((b: any) => b.result !== 'RUNNING');
-    const passed = completed.filter((b: any) => b.result === 'SUCCESS').length;
-    const stabilityPct = completed.length > 0 ? Math.round((passed / completed.length) * 100) : null;
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          jobPath: args.jobPath,
-          stability: stabilityPct !== null ? `${stabilityPct}%` : 'n/a',
-          builds,
-        }, null, 2),
-      }],
-    };
-  }
-
-  /**
-   * get_build_changes
-   * Returns the SCM changesets (commits) included in a specific build.
-   */
-  private async getBuildChanges(args: any) {
-    if (!args?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
-    const buildNumber = args.buildNumber || 'lastBuild';
-
-    const response = await this.axiosInstance.get(`/${args.jobPath}/${buildNumber}/api/json`, {
-      params: {
-        tree: 'number,result,changeSets[items[commitId,msg,author[fullName],timestamp,affectedPaths]]',
-      },
-    });
-
-    const changeSets = response.data.changeSets || [];
-    const commits = changeSets.flatMap((cs: any) =>
-      (cs.items || []).map((item: any) => ({
-        commitId: item.commitId,
-        author: item.author?.fullName ?? 'unknown',
-        message: item.msg,
-        timestamp: item.timestamp ? new Date(item.timestamp).toISOString() : null,
-        filesChanged: (item.affectedPaths || []).length,
-      }))
-    );
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          jobPath: args.jobPath,
-          buildNumber: response.data.number,
-          result: response.data.result,
-          totalCommits: commits.length,
-          commits,
-        }, null, 2),
-      }],
-    };
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // NEW: TEST & QUALITY
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * get_test_results
-   * Fetches the JUnit/test report from a build: pass/fail/skip counts + failed test names.
-   */
-  private async getTestResults(args: any) {
-    if (!args?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
-    const buildNumber = args.buildNumber || 'lastBuild';
-
-    let report: any;
-    try {
-      const response = await this.axiosInstance.get(
-        `/${args.jobPath}/${buildNumber}/testReport/api/json`,
-        {
-          params: {
-            tree: 'failCount,passCount,skipCount,suites[cases[className,name,status,duration]]',
-          },
-        }
-      );
-      report = response.data;
-    } catch (err: any) {
-      if (err?.response?.status === 404) {
-        return {
-          content: [{
-            type: 'text',
-            text: `No test report found for build "${buildNumber}" of "${args.jobPath}". The job may not publish test results.`,
-          }],
-        };
-      }
-      throw err;
-    }
-
-    const failedTests = (report.suites || [])
-      .flatMap((suite: any) => suite.cases || [])
-      .filter((c: any) => c.status === 'FAILED' || c.status === 'REGRESSION')
-      .map((c: any) => ({
-        class: c.className,
-        test: c.name,
-        durationSeconds: c.duration,
-      }));
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          jobPath: args.jobPath,
-          buildNumber,
-          summary: {
-            passed: report.passCount,
-            failed: report.failCount,
-            skipped: report.skipCount,
-            total: (report.passCount ?? 0) + (report.failCount ?? 0) + (report.skipCount ?? 0),
-          },
-          failedTests,
-        }, null, 2),
-      }],
-    };
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // NEW: INFRASTRUCTURE
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * get_nodes
-   * Returns all Jenkins agents/nodes with status, executor count, and labels.
-   */
-  private async getNodes() {
-    const response = await this.axiosInstance.get('/computer/api/json', {
-      params: {
-        tree: 'computer[displayName,description,offline,temporarilyOffline,numExecutors,idle,assignedLabels[name]]',
-      },
-    });
-
-    const nodes = (response.data.computer || []).map((node: any) => ({
-      name: node.displayName,
-      description: node.description || null,
-      status: node.offline ? (node.temporarilyOffline ? 'temporarily-offline' : 'offline') : 'online',
-      idle: node.idle,
-      numExecutors: node.numExecutors,
-      labels: (node.assignedLabels || []).map((l: any) => l.name).filter(Boolean),
-    }));
-
-    const online = nodes.filter((n: any) => n.status === 'online').length;
-    const offline = nodes.length - online;
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({ summary: { total: nodes.length, online, offline }, nodes }, null, 2),
-      }],
-    };
-  }
-
-  /**
-   * toggle_job
-   * Enables or disables a Jenkins job via POST to /enable or /disable.
-   */
-  private async toggleJob(args: any) {
-    if (!args?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
-    if (!['enable', 'disable'].includes(args.action)) {
-      throw new McpError(ErrorCode.InvalidParams, 'action must be "enable" or "disable"');
-    }
-
-    const crumbResp = await this.axiosInstance.get('/crumbIssuer/api/json');
-    await this.axiosInstance.post(`/${args.jobPath}/${args.action}`, {}, {
-      headers: { [crumbResp.data.crumbRequestField]: crumbResp.data.crumb },
-    });
-
-    return {
-      content: [{
-        type: 'text',
-        text: `Job "${args.jobPath}" has been ${args.action}d successfully.`,
-      }],
-    };
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // NEW: DISCOVERY
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * search_jobs
-   * Searches all top-level jobs by name (substring match). Returns matching jobs
-   * with their last build status.
-   */
-  private async searchJobs(args: any) {
-    if (!args?.query) throw new McpError(ErrorCode.InvalidParams, 'query is required');
-    const query: string = args.query;
-    const caseSensitive: boolean = args.caseSensitive ?? false;
-
-    const response = await this.axiosInstance.get('/api/json', {
+  private async searchJobs(a: any) {
+    if (!a?.query) throw new McpError(ErrorCode.InvalidParams, 'query is required');
+    const cs: boolean = a.caseSensitive ?? false;
+    const r = await this.http.get('/api/json', {
       params: { tree: 'jobs[name,url,color,lastBuild[number,result,url]]' },
     });
-
-    const needle = caseSensitive ? query : query.toLowerCase();
-
-    const matches = (response.data.jobs || [])
-      .filter((job: any) => {
-        const haystack = caseSensitive ? job.name : job.name.toLowerCase();
-        return haystack.includes(needle);
-      })
-      .map((job: any) => ({
-        name: job.name,
-        url: job.url,
-        lastBuildResult: job.lastBuild?.result ?? null,
-        lastBuildNumber: job.lastBuild?.number ?? null,
-        lastBuildUrl: job.lastBuild?.url ?? null,
-        statusColor: job.color,
+    const needle = cs ? a.query : a.query.toLowerCase();
+    const matches = (r.data.jobs || [])
+      .filter((j: any) => (cs ? j.name : j.name.toLowerCase()).includes(needle))
+      .map((j: any) => ({
+        name: j.name, url: j.url, statusColor: j.color,
+        lastBuildResult: j.lastBuild?.result ?? null, lastBuildNumber: j.lastBuild?.number ?? null,
       }));
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({ query, count: matches.length, matches }, null, 2),
-      }],
-    };
+    return this.json({ query: a.query, count: matches.length, matches });
   }
 
-  /**
-   * get_job_parameters
-   * Returns all parameter definitions for a job: name, type, default value, and description.
-   * Useful before calling trigger_build so you know exactly what to pass.
-   */
-  private async getJobParameters(args: any) {
-    if (!args?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
-
-    const response = await this.axiosInstance.get(`/${args.jobPath}/api/json`, {
-      params: {
-        tree: 'property[parameterDefinitions[name,type,description,defaultParameterValue[value]]]',
-      },
+  private async getJobParameters(a: any) {
+    if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const r = await this.http.get(`/${a.jobPath}/api/json`, {
+      params: { tree: 'property[parameterDefinitions[name,type,description,defaultParameterValue[value]]]' },
     });
-
-    const paramDefs = (response.data.property || [])
-      .flatMap((prop: any) => prop.parameterDefinitions || [])
+    const defs = (r.data.property || [])
+      .flatMap((p: any) => p.parameterDefinitions || [])
       .map((p: any) => ({
-        name: p.name,
-        type: p.type,
-        description: p.description || null,
+        name: p.name, type: p.type, description: p.description || null,
         defaultValue: p.defaultParameterValue?.value ?? null,
       }));
-
-    if (paramDefs.length === 0) {
-      return {
-        content: [{
-          type: 'text',
-          text: `Job "${args.jobPath}" has no defined parameters (it is a non-parameterized job).`,
-        }],
-      };
-    }
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({ jobPath: args.jobPath, parameterCount: paramDefs.length, parameters: paramDefs }, null, 2),
-      }],
-    };
+    if (!defs.length) return this.ok(`Job "${a.jobPath}" has no defined parameters.`);
+    return this.json({ jobPath: a.jobPath, parameterCount: defs.length, parameters: defs });
   }
 
-  // ─── Bootstrap ────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // LOGS
+  // ═══════════════════════════════════════════════════════════════════════════
+  private async getBuildLog(a: any) {
+    const r = await this.http.get(`/${a.jobPath}/${a.buildNumber}/consoleText`);
+    return this.ok(r.data);
+  }
 
+  private async getFailedBuildLog(a: any) {
+    if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const info = await this.http.get(`/${a.jobPath}/api/json`, {
+      params: { tree: 'name,lastFailedBuild[number]' },
+    });
+    const num = info.data.lastFailedBuild?.number;
+    if (!num) return this.ok(`Job "${info.data.name}" has no failed builds.`);
+    const log = await this.http.get(`/${a.jobPath}/${num}/consoleText`);
+    return this.ok(log.data);
+  }
+
+  /** NEW: tail last N lines of a build log */
+  private async getBuildLogTail(a: any) {
+    if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const num = a.buildNumber || 'lastBuild';
+    const lines = Math.max(1, a.lines ?? 100);
+    const r = await this.http.get(`/${a.jobPath}/${num}/consoleText`);
+    const tail = (r.data as string).split('\n').slice(-lines).join('\n');
+    return this.ok(tail);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TRIGGER & CONTROL
+  // ═══════════════════════════════════════════════════════════════════════════
+  private async triggerBuild(a: any) {
+    if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const params = a.parameters && Object.keys(a.parameters).length ? a.parameters : null;
+    const entries: Record<string,string> = params
+      ? Object.fromEntries(Object.entries(params).map(([k,v]) => [k, String(v)])) : {};
+    if (params) {
+      await this.post(`/${a.jobPath}/buildWithParameters`, entries);
+      return this.ok('Parameterized build triggered successfully.');
+    }
+    await this.post(`/${a.jobPath}/build`);
+    return this.ok('Build triggered successfully.');
+  }
+
+  private async abortBuild(a: any) {
+    if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const num = a.buildNumber || 'lastBuild';
+    const status = await this.http.get(`/${a.jobPath}/${num}/api/json`);
+    if (!status.data.building) {
+      return this.ok(`Build #${status.data.number} is not running (result: ${status.data.result ?? 'unknown'}).`);
+    }
+    await this.post(`/${a.jobPath}/${status.data.number}/stop`);
+    return this.ok(`Build #${status.data.number} of "${a.jobPath}" aborted.`);
+  }
+
+  private async retryFailedBuild(a: any) {
+    if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const info = await this.http.get(`/${a.jobPath}/api/json`, {
+      params: { tree: 'lastFailedBuild[number,actions[parameters[name,value]]]' },
+    });
+    const lastFailed = info.data.lastFailedBuild;
+    if (!lastFailed?.number) return this.ok(`No failed builds found for "${a.jobPath}".`);
+    const params: Record<string,string> = {};
+    for (const action of lastFailed.actions || [])
+      for (const p of action.parameters || []) params[p.name] = p.value;
+    const hasParams = Object.keys(params).length > 0;
+    if (hasParams) await this.post(`/${a.jobPath}/buildWithParameters`, params);
+    else           await this.post(`/${a.jobPath}/build`);
+    return this.json({ message: `Retried build #${lastFailed.number} of "${a.jobPath}".`, parametersUsed: hasParams ? params : '(none)' });
+  }
+
+  private async bulkTrigger(a: any) {
+    if (!Array.isArray(a?.jobs) || !a.jobs.length)
+      throw new McpError(ErrorCode.InvalidParams, 'jobs array is required');
+    const results: Array<{ jobPath: string; status: string; error?: string }> = [];
+    for (const job of a.jobs) {
+      try {
+        const params = job.parameters && Object.keys(job.parameters).length
+          ? Object.fromEntries(Object.entries(job.parameters).map(([k,v]) => [k, String(v)])) : null;
+        if (params) await this.post(`/${job.jobPath}/buildWithParameters`, params);
+        else        await this.post(`/${job.jobPath}/build`);
+        results.push({ jobPath: job.jobPath, status: 'triggered' });
+      } catch (err: any) {
+        results.push({ jobPath: job.jobPath, status: 'failed', error: err?.message ?? 'unknown' });
+      }
+    }
+    const succeeded = results.filter(r => r.status === 'triggered').length;
+    return this.json({ summary: { total: results.length, succeeded, failed: results.length - succeeded }, results });
+  }
+
+  private async toggleJob(a: any) {
+    if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    if (!['enable','disable'].includes(a.action))
+      throw new McpError(ErrorCode.InvalidParams, 'action must be "enable" or "disable"');
+    await this.post(`/${a.jobPath}/${a.action}`);
+    return this.ok(`Job "${a.jobPath}" ${a.action}d successfully.`);
+  }
+
+  /** NEW: copy/clone an existing job */
+  private async copyJob(a: any) {
+    if (!a?.sourceJobPath || !a?.newJobName)
+      throw new McpError(ErrorCode.InvalidParams, 'sourceJobPath and newJobName are required');
+    const crumb = await this.getCrumb();
+    const params = new URLSearchParams({ name: a.newJobName, mode: 'copy', from: a.sourceJobPath });
+    await this.http.post('/createItem', params, {
+      headers: { ...crumb, 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+    return this.ok(`Job "${a.newJobName}" created as a copy of "${a.sourceJobPath}".`);
+  }
+
+  /** NEW: delete a specific build record */
+  private async deleteBuild(a: any) {
+    if (!a?.jobPath || !a?.buildNumber)
+      throw new McpError(ErrorCode.InvalidParams, 'jobPath and buildNumber are required');
+    await this.post(`/${a.jobPath}/${a.buildNumber}/doDelete`);
+    return this.ok(`Build #${a.buildNumber} of "${a.jobPath}" deleted.`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MONITORING
+  // ═══════════════════════════════════════════════════════════════════════════
+  private async getRunningBuilds() {
+    const r = await this.http.get('/api/json', {
+      params: { tree: 'jobs[name,url,lastBuild[number,building,timestamp,url]]' },
+    });
+    const running = (r.data.jobs || [])
+      .filter((j: any) => j.lastBuild?.building)
+      .map((j: any) => ({
+        name: j.name, jobUrl: j.url, buildNumber: j.lastBuild.number, buildUrl: j.lastBuild.url,
+        startedAt: new Date(j.lastBuild.timestamp).toISOString(),
+        runningForSeconds: Math.floor((Date.now() - j.lastBuild.timestamp) / 1000),
+      }));
+    return this.json({ count: running.length, runningBuilds: running });
+  }
+
+  private async getQueueItems() {
+    const r = await this.http.get('/queue/api/json', {
+      params: { tree: 'items[id,inQueueSince,why,blocked,stuck,task[name,url],actions[parameters[name,value]]]' },
+    });
+    const items = (r.data.items || []).map((item: any) => ({
+      id: item.id, jobName: item.task?.name, jobUrl: item.task?.url,
+      inQueueSince: new Date(item.inQueueSince).toISOString(),
+      waitingForSeconds: Math.floor((Date.now() - item.inQueueSince) / 1000),
+      blocked: item.blocked, stuck: item.stuck, reason: item.why,
+      parameters: (item.actions || []).flatMap((a: any) => a.parameters || [])
+        .reduce((acc: any, p: any) => { acc[p.name] = p.value; return acc; }, {}),
+    }));
+    return this.json({ count: items.length, queueItems: items });
+  }
+
+  /** NEW: cancel a queue item */
+  private async cancelQueueItem(a: any) {
+    if (!a?.itemId) throw new McpError(ErrorCode.InvalidParams, 'itemId is required');
+    await this.post(`/queue/cancelItem?id=${a.itemId}`);
+    return this.ok(`Queue item ${a.itemId} cancelled.`);
+  }
+
+  private async getBuildHistory(a: any) {
+    if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const limit = a.limit ?? 10;
+    const r = await this.http.get(`/${a.jobPath}/api/json`, {
+      params: { tree: `builds[number,result,duration,timestamp,url]{0,${limit}}` },
+    });
+    const builds = (r.data.builds || []).map((b: any) => ({
+      number: b.number, result: b.result ?? (b.duration === 0 ? 'RUNNING' : 'UNKNOWN'),
+      durationSeconds: Math.floor(b.duration / 1000),
+      startedAt: new Date(b.timestamp).toISOString(), url: b.url,
+    }));
+    const completed = builds.filter((b: any) => b.result !== 'RUNNING');
+    const passed = completed.filter((b: any) => b.result === 'SUCCESS').length;
+    const stability = completed.length ? `${Math.round((passed / completed.length) * 100)}%` : 'n/a';
+    return this.json({ jobPath: a.jobPath, stability, builds });
+  }
+
+  private async getBuildChanges(a: any) {
+    if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const num = a.buildNumber || 'lastBuild';
+    const r = await this.http.get(`/${a.jobPath}/${num}/api/json`, {
+      params: { tree: 'number,result,changeSets[items[commitId,msg,author[fullName],timestamp,affectedPaths]]' },
+    });
+    const commits = (r.data.changeSets || []).flatMap((cs: any) =>
+      (cs.items || []).map((item: any) => ({
+        commitId: item.commitId, author: item.author?.fullName ?? 'unknown',
+        message: item.msg, filesChanged: (item.affectedPaths || []).length,
+        timestamp: item.timestamp ? new Date(item.timestamp).toISOString() : null,
+      }))
+    );
+    return this.json({ jobPath: a.jobPath, buildNumber: r.data.number, result: r.data.result, totalCommits: commits.length, commits });
+  }
+
+  /** NEW: list build artifacts */
+  private async getBuildArtifacts(a: any) {
+    if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const num = a.buildNumber || 'lastBuild';
+    const r = await this.http.get(`/${a.jobPath}/${num}/api/json`, {
+      params: { tree: 'number,artifacts[displayPath,relativePath,fileName]' },
+    });
+    const artifacts = (r.data.artifacts || []).map((art: any) => ({
+      fileName: art.fileName, displayPath: art.displayPath,
+      downloadUrl: `${JENKINS_URL}/${a.jobPath}/${r.data.number}/artifact/${art.relativePath}`,
+    }));
+    return this.json({ jobPath: a.jobPath, buildNumber: r.data.number, count: artifacts.length, artifacts });
+  }
+
+  /** NEW: build timing detail */
+  private async getBuildTimings(a: any) {
+    if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const num = a.buildNumber || 'lastBuild';
+    const r = await this.http.get(`/${a.jobPath}/${num}/api/json`, {
+      params: { tree: 'number,building,timestamp,duration,estimatedDuration,result' },
+    });
+    const d = r.data;
+    const elapsed = d.building ? Date.now() - d.timestamp : d.duration;
+    return this.json({
+      buildNumber: d.number, building: d.building, result: d.result,
+      startedAt: new Date(d.timestamp).toISOString(),
+      elapsedSeconds: Math.floor(elapsed / 1000),
+      estimatedTotalSeconds: Math.floor(d.estimatedDuration / 1000),
+      remainingSeconds: d.building ? Math.max(0, Math.floor((d.estimatedDuration - elapsed) / 1000)) : null,
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TEST & QUALITY
+  // ═══════════════════════════════════════════════════════════════════════════
+  private async getTestResults(a: any) {
+    if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const num = a.buildNumber || 'lastBuild';
+    let report: any;
+    try {
+      const r = await this.http.get(`/${a.jobPath}/${num}/testReport/api/json`, {
+        params: { tree: 'failCount,passCount,skipCount,suites[cases[className,name,status,duration]]' },
+      });
+      report = r.data;
+    } catch (err: any) {
+      if (err?.response?.status === 404)
+        return this.ok(`No test report found for build "${num}" of "${a.jobPath}".`);
+      throw err;
+    }
+    const failedTests = (report.suites || [])
+      .flatMap((s: any) => s.cases || [])
+      .filter((c: any) => ['FAILED','REGRESSION'].includes(c.status))
+      .map((c: any) => ({ class: c.className, test: c.name, durationSeconds: c.duration }));
+    return this.json({
+      jobPath: a.jobPath, buildNumber: num,
+      summary: {
+        passed: report.passCount, failed: report.failCount, skipped: report.skipCount,
+        total: (report.passCount ?? 0) + (report.failCount ?? 0) + (report.skipCount ?? 0),
+      },
+      failedTests,
+    });
+  }
+
+  /** NEW: identify flaky tests across last N builds */
+  private async getFlakyTests(a: any) {
+    if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const limit = a.limit ?? 10;
+    // Collect build numbers
+    const histResp = await this.http.get(`/${a.jobPath}/api/json`, {
+      params: { tree: `builds[number,result]{0,${limit}}` },
+    });
+    const builds: number[] = (histResp.data.builds || [])
+      .filter((b: any) => b.result && b.result !== 'ABORTED')
+      .map((b: any) => b.number);
+
+    // Per-test result map: testKey → array of 'PASS'|'FAIL'
+    const testHistory: Record<string, string[]> = {};
+    await Promise.all(builds.map(async (num) => {
+      try {
+        const r = await this.http.get(`/${a.jobPath}/${num}/testReport/api/json`, {
+          params: { tree: 'suites[cases[className,name,status]]' },
+        });
+        for (const suite of r.data.suites || []) {
+          for (const c of suite.cases || []) {
+            const key = `${c.className}#${c.name}`;
+            if (!testHistory[key]) testHistory[key] = [];
+            testHistory[key].push(['FAILED','REGRESSION'].includes(c.status) ? 'FAIL' : 'PASS');
+          }
+        }
+      } catch { /* no test report for this build — skip */ }
+    }));
+
+    const flaky = Object.entries(testHistory)
+      .filter(([, results]) => results.includes('PASS') && results.includes('FAIL'))
+      .map(([key, results]) => {
+        const [className, testName] = key.split('#');
+        const failRate = Math.round((results.filter(r => r === 'FAIL').length / results.length) * 100);
+        return { className, testName, failRate: `${failRate}%`, history: results };
+      })
+      .sort((x, y) => parseInt(y.failRate) - parseInt(x.failRate));
+
+    return this.json({ jobPath: a.jobPath, buildsAnalysed: builds.length, flakyTestCount: flaky.length, flakyTests: flaky });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // NODES / INFRASTRUCTURE
+  // ═══════════════════════════════════════════════════════════════════════════
+  private async getNodes() {
+    const r = await this.http.get('/computer/api/json', {
+      params: { tree: 'computer[displayName,description,offline,temporarilyOffline,numExecutors,idle,assignedLabels[name]]' },
+    });
+    const nodes = (r.data.computer || []).map((n: any) => ({
+      name: n.displayName, description: n.description || null,
+      status: n.offline ? (n.temporarilyOffline ? 'temporarily-offline' : 'offline') : 'online',
+      idle: n.idle, numExecutors: n.numExecutors,
+      labels: (n.assignedLabels || []).map((l: any) => l.name).filter(Boolean),
+    }));
+    const online = nodes.filter((n: any) => n.status === 'online').length;
+    return this.json({ summary: { total: nodes.length, online, offline: nodes.length - online }, nodes });
+  }
+
+  /** NEW: take a node online / mark it offline */
+  private async toggleNode(a: any) {
+    if (!a?.nodeName || !a?.action)
+      throw new McpError(ErrorCode.InvalidParams, 'nodeName and action are required');
+    const crumb = await this.getCrumb();
+    const encoded = encodeURIComponent(a.nodeName);
+    if (a.action === 'offline') {
+      const params = new URLSearchParams({ offlineMessage: a.reason || '' });
+      await this.http.post(`/computer/${encoded}/toggleOffline?offlineMessage=${encodeURIComponent(a.reason || '')}`, {}, { headers: crumb });
+    } else {
+      await this.http.post(`/computer/${encoded}/toggleOffline`, {}, { headers: crumb });
+    }
+    return this.ok(`Node "${a.nodeName}" set to ${a.action}.`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SERVER HEALTH
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** NEW: server overview */
+  private async getServerInfo() {
+    const r = await this.http.get('/api/json', {
+      params: { tree: 'quietingDown,useSecurity,numExecutors,jobs[_class]' },
+    });
+    const versionHeader = (await this.http.get('/')).headers['x-jenkins'];
+    return this.json({
+      jenkinsVersion: versionHeader ?? 'unknown',
+      quietingDown: r.data.quietingDown,
+      useSecurity: r.data.useSecurity,
+      totalExecutors: r.data.numExecutors,
+      topLevelJobCount: (r.data.jobs || []).length,
+    });
+  }
+
+  /** NEW: quiet-down / cancel quiet-down */
+  private async quietDown(a: any) {
+    if (!['start','cancel'].includes(a?.action))
+      throw new McpError(ErrorCode.InvalidParams, 'action must be "start" or "cancel"');
+    const endpoint = a.action === 'start' ? '/quietDown' : '/cancelQuietDown';
+    await this.post(endpoint);
+    return this.ok(`Quiet-down ${a.action === 'start' ? 'initiated' : 'cancelled'}.`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // USERS
+  // ═══════════════════════════════════════════════════════════════════════════
+  private async createJenkinsUser(a: any) {
+    const { username, password, fullName, email } = a || {};
+    if (!username || !password) throw new McpError(ErrorCode.InvalidParams, 'username and password are required');
+    const crumb = await this.getCrumb();
+    const params = new URLSearchParams({ username, password1: password, password2: password });
+    if (fullName) params.append('fullname', fullName);
+    if (email)    params.append('email', email);
+    await this.http.post('/securityRealm/createAccountByAdmin', params, {
+      headers: { ...crumb, 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+    return this.ok(`User "${username}" created successfully.`);
+  }
+
+  /** NEW: list all users */
+  private async listUsers() {
+    const r = await this.http.get('/asynchPeople/api/json', {
+      params: { tree: 'users[user[id,fullName],lastChange]' },
+    });
+    const users = (r.data.users || []).map((u: any) => ({
+      id: u.user?.id, fullName: u.user?.fullName,
+      lastChange: u.lastChange ? new Date(u.lastChange).toISOString() : null,
+    }));
+    return this.json({ count: users.length, users });
+  }
+
+  // ─── Bootstrap ─────────────────────────────────────────────────────────────
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Jenkins MCP server running on stdio');
+    console.error('Jenkins MCP server v0.3.0 running on stdio');
   }
 }
 
