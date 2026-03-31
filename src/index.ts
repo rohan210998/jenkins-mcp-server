@@ -8,28 +8,23 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import axios, { AxiosInstance } from 'axios';
-
 const JENKINS_URL  = process.env.JENKINS_URL  || '';
 const JENKINS_USER = process.env.JENKINS_USER || '';
 const JENKINS_TOKEN= process.env.JENKINS_TOKEN|| '';
-
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface FlatJob {
   name: string; fullPath: string; url: string;
   lastBuild: { number: number; result: string; url: string } | null;
   isFolder: boolean;
 }
-
 // ─── Shared tool schema helpers ────────────────────────────────────────────────
 const jobPathProp    = { jobPath:    { type: 'string', description: 'Path to the Jenkins job' } };
 const buildNumProp   = { buildNumber:{ type: 'string', description: 'Build number or "lastBuild"', default: 'lastBuild' } };
 const limitProp      = { limit:      { type: 'number', description: 'Max results to return (default 10)', default: 10 } };
-
 class JenkinsServer {
   private server: Server;
   private http: AxiosInstance;
   private crumbCache: { field: string; value: string; ts: number } | null = null;
-
   constructor() {
     this.server = new Server(
       { name: 'jenkins-server', version: '0.3.0' },
@@ -44,15 +39,12 @@ class JenkinsServer {
     this.server.onerror = (err) => console.error('[MCP Error]', err);
     process.on('SIGINT', async () => { await this.server.close(); process.exit(0); });
   }
-
   // ─── Helpers ────────────────────────────────────────────────────────────────
-
   /** "FolderA/Sub/Job"  →  "job/FolderA/job/Sub/job/Job" */
   private toJenkinsPath(path: string): string {
     return path.split('/').map(s => s.trim()).filter(Boolean)
       .map(s => `job/${encodeURIComponent(s)}`).join('/');
   }
-
   /** Cached crumb (5-min TTL) to reduce round-trips */
   private async getCrumb(): Promise<Record<string, string>> {
     const now = Date.now();
@@ -63,7 +55,6 @@ class JenkinsServer {
     this.crumbCache = { field: r.data.crumbRequestField, value: r.data.crumb, ts: now };
     return { [r.data.crumbRequestField]: r.data.crumb };
   }
-
   /** POST helper — always fetches fresh crumb header */
   private async post(path: string, body: Record<string,string> | null = null) {
     const crumb = await this.getCrumb();
@@ -75,10 +66,8 @@ class JenkinsServer {
     }
     return this.http.post(path, {}, { headers: crumb });
   }
-
   private ok(text: string)  { return { content: [{ type: 'text', text }] }; }
   private json(data: unknown){ return this.ok(JSON.stringify(data, null, 2)); }
-
   // ─── Tool Registration ───────────────────────────────────────────────────────
   private setupToolHandlers() {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -142,7 +131,7 @@ class JenkinsServer {
           inputSchema: { type: 'object', properties: { ...jobPathProp }, required: ['jobPath'] },
         },
         {
-          name: 'get_build_log_tail',   // NEW
+          name: 'get_build_log_tail',
           description: 'Get only the last N lines of a build\'s console output — faster for large logs.',
           inputSchema: {
             type: 'object',
@@ -200,7 +189,7 @@ class JenkinsServer {
           },
         },
         {
-          name: 'copy_job',           // NEW
+          name: 'copy_job',
           description: 'Copy (clone) an existing Jenkins job to a new name.',
           inputSchema: {
             type: 'object',
@@ -212,7 +201,7 @@ class JenkinsServer {
           },
         },
         {
-          name: 'delete_build',       // NEW
+          name: 'delete_build',
           description: 'Permanently delete a specific build record from Jenkins.',
           inputSchema: { type: 'object', properties: { ...jobPathProp, ...buildNumProp }, required: ['jobPath', 'buildNumber'] },
         },
@@ -228,7 +217,7 @@ class JenkinsServer {
           inputSchema: { type: 'object', properties: {}, required: [] },
         },
         {
-          name: 'cancel_queue_item',  // NEW
+          name: 'cancel_queue_item',
           description: 'Cancel a specific item waiting in the Jenkins queue.',
           inputSchema: {
             type: 'object',
@@ -247,12 +236,12 @@ class JenkinsServer {
           inputSchema: { type: 'object', properties: { ...jobPathProp, ...buildNumProp }, required: ['jobPath'] },
         },
         {
-          name: 'get_build_artifacts', // NEW
+          name: 'get_build_artifacts',
           description: 'List artifacts produced by a build (name + download URL).',
           inputSchema: { type: 'object', properties: { ...jobPathProp, ...buildNumProp }, required: ['jobPath'] },
         },
         {
-          name: 'get_build_timings',   // NEW
+          name: 'get_build_timings',
           description: 'Return start time, duration, and estimated remaining time for a build.',
           inputSchema: { type: 'object', properties: { ...jobPathProp, ...buildNumProp }, required: ['jobPath'] },
         },
@@ -263,7 +252,7 @@ class JenkinsServer {
           inputSchema: { type: 'object', properties: { ...jobPathProp, ...buildNumProp }, required: ['jobPath'] },
         },
         {
-          name: 'get_flaky_tests',     // NEW
+          name: 'get_flaky_tests',
           description: 'Identify tests that flip between PASS and FAIL across the last N builds.',
           inputSchema: {
             type: 'object',
@@ -278,7 +267,7 @@ class JenkinsServer {
           inputSchema: { type: 'object', properties: {}, required: [] },
         },
         {
-          name: 'toggle_node',         // NEW
+          name: 'toggle_node',
           description: 'Take a node online or mark it temporarily offline.',
           inputSchema: {
             type: 'object',
@@ -292,12 +281,12 @@ class JenkinsServer {
         },
         // ── Server Health ─────────────────────────────────────────────────────
         {
-          name: 'get_server_info',     // NEW
+          name: 'get_server_info',
           description: 'Return Jenkins version, number of executors, load statistics, and quiet-down status.',
           inputSchema: { type: 'object', properties: {}, required: [] },
         },
         {
-          name: 'quiet_down',          // NEW
+          name: 'quiet_down',
           description: 'Put the Jenkins server into quiet-down (preparation for shutdown) or cancel it.',
           inputSchema: {
             type: 'object',
@@ -319,13 +308,12 @@ class JenkinsServer {
           },
         },
         {
-          name: 'list_users',          // NEW
+          name: 'list_users',
           description: 'List all Jenkins users.',
           inputSchema: { type: 'object', properties: {}, required: [] },
         },
       ],
     }));
-
     this.server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const a = req.params.arguments as any;
       try {
@@ -385,13 +373,13 @@ class JenkinsServer {
       }
     });
   }
-
   // ═══════════════════════════════════════════════════════════════════════════
   // STATUS & INFO
   // ═══════════════════════════════════════════════════════════════════════════
   private async getBuildStatus(a: any) {
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
     const num = a.buildNumber || 'lastBuild';
-    const r = await this.http.get(`/${a.jobPath}/${num}/api/json`);
+    const r = await this.http.get(`/${jp}/${num}/api/json`);
     return this.json({
       number: r.data.number,
       building: r.data.building,
@@ -401,7 +389,6 @@ class JenkinsServer {
       url: r.data.url,
     });
   }
-
   private async listAllJobs() {
     const r = await this.http.get('/api/json', {
       params: { tree: 'jobs[name,url,color,lastBuild[number,result,url]]' },
@@ -412,7 +399,6 @@ class JenkinsServer {
     }));
     return this.json({ count: jobs.length, jobs });
   }
-
   private async listFolderJobs(a: any) {
     const folderPath: string = a?.folderPath ?? '';
     if (!folderPath.trim()) throw new McpError(ErrorCode.InvalidParams, 'folderPath is required');
@@ -442,7 +428,6 @@ class JenkinsServer {
       jobs: flat,
     });
   }
-
   private async listRecentFailedJobs(a: any) {
     const limit = a?.limit ?? 10;
     const r = await this.http.get('/api/json', {
@@ -460,13 +445,11 @@ class JenkinsServer {
       }));
     return this.json({ count: failed.length, failedJobs: failed });
   }
-
   private async countFailedJobs() {
     const r = await this.http.get('/api/json', { params: { tree: 'jobs[lastBuild[result]]' } });
     const count = (r.data.jobs || []).filter((j: any) => j.lastBuild?.result === 'FAILURE').length;
     return this.json({ failedJobCount: count });
   }
-
   private async searchJobs(a: any) {
     if (!a?.query) throw new McpError(ErrorCode.InvalidParams, 'query is required');
     const cs: boolean = a.caseSensitive ?? false;
@@ -482,10 +465,10 @@ class JenkinsServer {
       }));
     return this.json({ query: a.query, count: matches.length, matches });
   }
-
   private async getJobParameters(a: any) {
     if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
-    const r = await this.http.get(`/${a.jobPath}/api/json`, {
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
+    const r = await this.http.get(`/${jp}/api/json`, {
       params: { tree: 'property[parameterDefinitions[name,type,description,defaultParameterValue[value]]]' },
     });
     const defs = (r.data.property || [])
@@ -497,66 +480,65 @@ class JenkinsServer {
     if (!defs.length) return this.ok(`Job "${a.jobPath}" has no defined parameters.`);
     return this.json({ jobPath: a.jobPath, parameterCount: defs.length, parameters: defs });
   }
-
   // ═══════════════════════════════════════════════════════════════════════════
   // LOGS
   // ═══════════════════════════════════════════════════════════════════════════
   private async getBuildLog(a: any) {
-    const r = await this.http.get(`/${a.jobPath}/${a.buildNumber}/consoleText`);
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
+    const r = await this.http.get(`/${jp}/${a.buildNumber}/consoleText`);
     return this.ok(r.data);
   }
-
   private async getFailedBuildLog(a: any) {
     if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
-    const info = await this.http.get(`/${a.jobPath}/api/json`, {
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
+    const info = await this.http.get(`/${jp}/api/json`, {
       params: { tree: 'name,lastFailedBuild[number]' },
     });
     const num = info.data.lastFailedBuild?.number;
     if (!num) return this.ok(`Job "${info.data.name}" has no failed builds.`);
-    const log = await this.http.get(`/${a.jobPath}/${num}/consoleText`);
+    const log = await this.http.get(`/${jp}/${num}/consoleText`);
     return this.ok(log.data);
   }
-
-  /** NEW: tail last N lines of a build log */
   private async getBuildLogTail(a: any) {
     if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
     const num = a.buildNumber || 'lastBuild';
     const lines = Math.max(1, a.lines ?? 100);
-    const r = await this.http.get(`/${a.jobPath}/${num}/consoleText`);
+    const r = await this.http.get(`/${jp}/${num}/consoleText`);
     const tail = (r.data as string).split('\n').slice(-lines).join('\n');
     return this.ok(tail);
   }
-
   // ═══════════════════════════════════════════════════════════════════════════
   // TRIGGER & CONTROL
   // ═══════════════════════════════════════════════════════════════════════════
   private async triggerBuild(a: any) {
     if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
     const params = a.parameters && Object.keys(a.parameters).length ? a.parameters : null;
     const entries: Record<string,string> = params
       ? Object.fromEntries(Object.entries(params).map(([k,v]) => [k, String(v)])) : {};
     if (params) {
-      await this.post(`/${a.jobPath}/buildWithParameters`, entries);
+      await this.post(`/${jp}/buildWithParameters`, entries);
       return this.ok('Parameterized build triggered successfully.');
     }
-    await this.post(`/${a.jobPath}/build`);
+    await this.post(`/${jp}/build`);
     return this.ok('Build triggered successfully.');
   }
-
   private async abortBuild(a: any) {
     if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
     const num = a.buildNumber || 'lastBuild';
-    const status = await this.http.get(`/${a.jobPath}/${num}/api/json`);
+    const status = await this.http.get(`/${jp}/${num}/api/json`);
     if (!status.data.building) {
       return this.ok(`Build #${status.data.number} is not running (result: ${status.data.result ?? 'unknown'}).`);
     }
-    await this.post(`/${a.jobPath}/${status.data.number}/stop`);
+    await this.post(`/${jp}/${status.data.number}/stop`);
     return this.ok(`Build #${status.data.number} of "${a.jobPath}" aborted.`);
   }
-
   private async retryFailedBuild(a: any) {
     if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
-    const info = await this.http.get(`/${a.jobPath}/api/json`, {
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
+    const info = await this.http.get(`/${jp}/api/json`, {
       params: { tree: 'lastFailedBuild[number,actions[parameters[name,value]]]' },
     });
     const lastFailed = info.data.lastFailedBuild;
@@ -565,21 +547,21 @@ class JenkinsServer {
     for (const action of lastFailed.actions || [])
       for (const p of action.parameters || []) params[p.name] = p.value;
     const hasParams = Object.keys(params).length > 0;
-    if (hasParams) await this.post(`/${a.jobPath}/buildWithParameters`, params);
-    else           await this.post(`/${a.jobPath}/build`);
+    if (hasParams) await this.post(`/${jp}/buildWithParameters`, params);
+    else           await this.post(`/${jp}/build`);
     return this.json({ message: `Retried build #${lastFailed.number} of "${a.jobPath}".`, parametersUsed: hasParams ? params : '(none)' });
   }
-
   private async bulkTrigger(a: any) {
     if (!Array.isArray(a?.jobs) || !a.jobs.length)
       throw new McpError(ErrorCode.InvalidParams, 'jobs array is required');
     const results: Array<{ jobPath: string; status: string; error?: string }> = [];
     for (const job of a.jobs) {
       try {
+        const jp = this.toJenkinsPath(job.jobPath);  // FIX: use toJenkinsPath
         const params = job.parameters && Object.keys(job.parameters).length
           ? Object.fromEntries(Object.entries(job.parameters).map(([k,v]) => [k, String(v)])) : null;
-        if (params) await this.post(`/${job.jobPath}/buildWithParameters`, params);
-        else        await this.post(`/${job.jobPath}/build`);
+        if (params) await this.post(`/${jp}/buildWithParameters`, params);
+        else        await this.post(`/${jp}/build`);
         results.push({ jobPath: job.jobPath, status: 'triggered' });
       } catch (err: any) {
         results.push({ jobPath: job.jobPath, status: 'failed', error: err?.message ?? 'unknown' });
@@ -588,35 +570,33 @@ class JenkinsServer {
     const succeeded = results.filter(r => r.status === 'triggered').length;
     return this.json({ summary: { total: results.length, succeeded, failed: results.length - succeeded }, results });
   }
-
   private async toggleJob(a: any) {
     if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
     if (!['enable','disable'].includes(a.action))
       throw new McpError(ErrorCode.InvalidParams, 'action must be "enable" or "disable"');
-    await this.post(`/${a.jobPath}/${a.action}`);
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
+    await this.post(`/${jp}/${a.action}`);
     return this.ok(`Job "${a.jobPath}" ${a.action}d successfully.`);
   }
-
-  /** NEW: copy/clone an existing job */
   private async copyJob(a: any) {
     if (!a?.sourceJobPath || !a?.newJobName)
       throw new McpError(ErrorCode.InvalidParams, 'sourceJobPath and newJobName are required');
     const crumb = await this.getCrumb();
-    const params = new URLSearchParams({ name: a.newJobName, mode: 'copy', from: a.sourceJobPath });
+    // FIX: convert source path for the 'from' parameter
+    const sourceFull = this.toJenkinsPath(a.sourceJobPath).replace(/^job\//, '').replace(/\/job\//g, '/');
+    const params = new URLSearchParams({ name: a.newJobName, mode: 'copy', from: sourceFull });
     await this.http.post('/createItem', params, {
       headers: { ...crumb, 'Content-Type': 'application/x-www-form-urlencoded' },
     });
     return this.ok(`Job "${a.newJobName}" created as a copy of "${a.sourceJobPath}".`);
   }
-
-  /** NEW: delete a specific build record */
   private async deleteBuild(a: any) {
     if (!a?.jobPath || !a?.buildNumber)
       throw new McpError(ErrorCode.InvalidParams, 'jobPath and buildNumber are required');
-    await this.post(`/${a.jobPath}/${a.buildNumber}/doDelete`);
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
+    await this.post(`/${jp}/${a.buildNumber}/doDelete`);
     return this.ok(`Build #${a.buildNumber} of "${a.jobPath}" deleted.`);
   }
-
   // ═══════════════════════════════════════════════════════════════════════════
   // MONITORING
   // ═══════════════════════════════════════════════════════════════════════════
@@ -633,7 +613,6 @@ class JenkinsServer {
       }));
     return this.json({ count: running.length, runningBuilds: running });
   }
-
   private async getQueueItems() {
     const r = await this.http.get('/queue/api/json', {
       params: { tree: 'items[id,inQueueSince,why,blocked,stuck,task[name,url],actions[parameters[name,value]]]' },
@@ -648,18 +627,16 @@ class JenkinsServer {
     }));
     return this.json({ count: items.length, queueItems: items });
   }
-
-  /** NEW: cancel a queue item */
   private async cancelQueueItem(a: any) {
     if (!a?.itemId) throw new McpError(ErrorCode.InvalidParams, 'itemId is required');
     await this.post(`/queue/cancelItem?id=${a.itemId}`);
     return this.ok(`Queue item ${a.itemId} cancelled.`);
   }
-
   private async getBuildHistory(a: any) {
     if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
     const limit = a.limit ?? 10;
-    const r = await this.http.get(`/${a.jobPath}/api/json`, {
+    const r = await this.http.get(`/${jp}/api/json`, {
       params: { tree: `builds[number,result,duration,timestamp,url]{0,${limit}}` },
     });
     const builds = (r.data.builds || []).map((b: any) => ({
@@ -672,11 +649,11 @@ class JenkinsServer {
     const stability = completed.length ? `${Math.round((passed / completed.length) * 100)}%` : 'n/a';
     return this.json({ jobPath: a.jobPath, stability, builds });
   }
-
   private async getBuildChanges(a: any) {
     if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
     const num = a.buildNumber || 'lastBuild';
-    const r = await this.http.get(`/${a.jobPath}/${num}/api/json`, {
+    const r = await this.http.get(`/${jp}/${num}/api/json`, {
       params: { tree: 'number,result,changeSets[items[commitId,msg,author[fullName],timestamp,affectedPaths]]' },
     });
     const commits = (r.data.changeSets || []).flatMap((cs: any) =>
@@ -688,26 +665,24 @@ class JenkinsServer {
     );
     return this.json({ jobPath: a.jobPath, buildNumber: r.data.number, result: r.data.result, totalCommits: commits.length, commits });
   }
-
-  /** NEW: list build artifacts */
   private async getBuildArtifacts(a: any) {
     if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
     const num = a.buildNumber || 'lastBuild';
-    const r = await this.http.get(`/${a.jobPath}/${num}/api/json`, {
+    const r = await this.http.get(`/${jp}/${num}/api/json`, {
       params: { tree: 'number,artifacts[displayPath,relativePath,fileName]' },
     });
     const artifacts = (r.data.artifacts || []).map((art: any) => ({
       fileName: art.fileName, displayPath: art.displayPath,
-      downloadUrl: `${JENKINS_URL}/${a.jobPath}/${r.data.number}/artifact/${art.relativePath}`,
+      downloadUrl: `${JENKINS_URL}/${jp}/${r.data.number}/artifact/${art.relativePath}`,
     }));
     return this.json({ jobPath: a.jobPath, buildNumber: r.data.number, count: artifacts.length, artifacts });
   }
-
-  /** NEW: build timing detail */
   private async getBuildTimings(a: any) {
     if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
     const num = a.buildNumber || 'lastBuild';
-    const r = await this.http.get(`/${a.jobPath}/${num}/api/json`, {
+    const r = await this.http.get(`/${jp}/${num}/api/json`, {
       params: { tree: 'number,building,timestamp,duration,estimatedDuration,result' },
     });
     const d = r.data;
@@ -720,16 +695,16 @@ class JenkinsServer {
       remainingSeconds: d.building ? Math.max(0, Math.floor((d.estimatedDuration - elapsed) / 1000)) : null,
     });
   }
-
   // ═══════════════════════════════════════════════════════════════════════════
   // TEST & QUALITY
   // ═══════════════════════════════════════════════════════════════════════════
   private async getTestResults(a: any) {
     if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
     const num = a.buildNumber || 'lastBuild';
     let report: any;
     try {
-      const r = await this.http.get(`/${a.jobPath}/${num}/testReport/api/json`, {
+      const r = await this.http.get(`/${jp}/${num}/testReport/api/json`, {
         params: { tree: 'failCount,passCount,skipCount,suites[cases[className,name,status,duration]]' },
       });
       report = r.data;
@@ -751,24 +726,20 @@ class JenkinsServer {
       failedTests,
     });
   }
-
-  /** NEW: identify flaky tests across last N builds */
   private async getFlakyTests(a: any) {
     if (!a?.jobPath) throw new McpError(ErrorCode.InvalidParams, 'jobPath is required');
+    const jp = this.toJenkinsPath(a.jobPath);  // FIX: use toJenkinsPath
     const limit = a.limit ?? 10;
-    // Collect build numbers
-    const histResp = await this.http.get(`/${a.jobPath}/api/json`, {
+    const histResp = await this.http.get(`/${jp}/api/json`, {
       params: { tree: `builds[number,result]{0,${limit}}` },
     });
     const builds: number[] = (histResp.data.builds || [])
       .filter((b: any) => b.result && b.result !== 'ABORTED')
       .map((b: any) => b.number);
-
-    // Per-test result map: testKey → array of 'PASS'|'FAIL'
     const testHistory: Record<string, string[]> = {};
     await Promise.all(builds.map(async (num) => {
       try {
-        const r = await this.http.get(`/${a.jobPath}/${num}/testReport/api/json`, {
+        const r = await this.http.get(`/${jp}/${num}/testReport/api/json`, {
           params: { tree: 'suites[cases[className,name,status]]' },
         });
         for (const suite of r.data.suites || []) {
@@ -780,7 +751,6 @@ class JenkinsServer {
         }
       } catch { /* no test report for this build — skip */ }
     }));
-
     const flaky = Object.entries(testHistory)
       .filter(([, results]) => results.includes('PASS') && results.includes('FAIL'))
       .map(([key, results]) => {
@@ -789,10 +759,8 @@ class JenkinsServer {
         return { className, testName, failRate: `${failRate}%`, history: results };
       })
       .sort((x, y) => parseInt(y.failRate) - parseInt(x.failRate));
-
     return this.json({ jobPath: a.jobPath, buildsAnalysed: builds.length, flakyTestCount: flaky.length, flakyTests: flaky });
   }
-
   // ═══════════════════════════════════════════════════════════════════════════
   // NODES / INFRASTRUCTURE
   // ═══════════════════════════════════════════════════════════════════════════
@@ -809,27 +777,21 @@ class JenkinsServer {
     const online = nodes.filter((n: any) => n.status === 'online').length;
     return this.json({ summary: { total: nodes.length, online, offline: nodes.length - online }, nodes });
   }
-
-  /** NEW: take a node online / mark it offline */
   private async toggleNode(a: any) {
     if (!a?.nodeName || !a?.action)
       throw new McpError(ErrorCode.InvalidParams, 'nodeName and action are required');
     const crumb = await this.getCrumb();
     const encoded = encodeURIComponent(a.nodeName);
     if (a.action === 'offline') {
-      const params = new URLSearchParams({ offlineMessage: a.reason || '' });
       await this.http.post(`/computer/${encoded}/toggleOffline?offlineMessage=${encodeURIComponent(a.reason || '')}`, {}, { headers: crumb });
     } else {
       await this.http.post(`/computer/${encoded}/toggleOffline`, {}, { headers: crumb });
     }
     return this.ok(`Node "${a.nodeName}" set to ${a.action}.`);
   }
-
   // ═══════════════════════════════════════════════════════════════════════════
   // SERVER HEALTH
   // ═══════════════════════════════════════════════════════════════════════════
-
-  /** NEW: server overview */
   private async getServerInfo() {
     const r = await this.http.get('/api/json', {
       params: { tree: 'quietingDown,useSecurity,numExecutors,jobs[_class]' },
@@ -843,8 +805,6 @@ class JenkinsServer {
       topLevelJobCount: (r.data.jobs || []).length,
     });
   }
-
-  /** NEW: quiet-down / cancel quiet-down */
   private async quietDown(a: any) {
     if (!['start','cancel'].includes(a?.action))
       throw new McpError(ErrorCode.InvalidParams, 'action must be "start" or "cancel"');
@@ -852,7 +812,6 @@ class JenkinsServer {
     await this.post(endpoint);
     return this.ok(`Quiet-down ${a.action === 'start' ? 'initiated' : 'cancelled'}.`);
   }
-
   // ═══════════════════════════════════════════════════════════════════════════
   // USERS
   // ═══════════════════════════════════════════════════════════════════════════
@@ -868,8 +827,6 @@ class JenkinsServer {
     });
     return this.ok(`User "${username}" created successfully.`);
   }
-
-  /** NEW: list all users */
   private async listUsers() {
     const r = await this.http.get('/asynchPeople/api/json', {
       params: { tree: 'users[user[id,fullName],lastChange]' },
@@ -880,7 +837,6 @@ class JenkinsServer {
     }));
     return this.json({ count: users.length, users });
   }
-
   // ─── Bootstrap ─────────────────────────────────────────────────────────────
   async run() {
     const transport = new StdioServerTransport();
@@ -888,6 +844,5 @@ class JenkinsServer {
     console.error('Jenkins MCP server v0.3.0 running on stdio');
   }
 }
-
 const server = new JenkinsServer();
 server.run().catch(console.error);
